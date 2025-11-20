@@ -102,18 +102,69 @@ def upsert_neighbors(neighbors):
             print(f"Upserted {len(chunk)} neighbors")
 
 def compute_and_upsert_neighbors(model, item_uniques):
+    """
+    Compute neighbors robustly across different return shapes from implicit.similar_items:
+      - list of (idx, score)
+      - tuple (indices_array, scores_array)
+      - 2D numpy array [[idx, score], ...]
+    Then upsert into itemneighbors in chunks.
+    """
+    import numpy as _np
+
     neighbors_to_upsert = []
-    for item_idx in range(len(item_uniques)):
+    n_items = len(item_uniques)
+    for item_idx in range(n_items):
         item_id = int(item_uniques[item_idx])
         try:
             sims = model.similar_items(item_idx, N=TOP_K+1)
         except Exception as e:
-            print("similar_items error", e)
+            print("similar_items error for item_idx", item_idx, ":", e)
             continue
-        for sim_idx, score in sims:
-            if sim_idx == item_idx: continue
-            if score <= MIN_SCORE: continue
-            neighbor_item = int(item_uniques[sim_idx])
+
+        # Normalize sims into iterable of (sim_idx, score)
+        pairs = []
+        # Case A: explicit tuple (indices_array, scores_array)
+        if isinstance(sims, tuple) and len(sims) == 2:
+            try:
+                indices, scores = sims
+                pairs = list(zip(indices, scores))
+            except Exception:
+                # fallback below
+                pairs = []
+        # Case B: numpy 2D array [[idx, score], ...]
+        elif isinstance(sims, _np.ndarray):
+            if sims.ndim == 2 and sims.shape[1] >= 2:
+                pairs = [(int(row[0]), float(row[1])) for row in sims]
+        # Case C: list-like of pairs (the expected default)
+        else:
+            try:
+                pairs = [(int(x[0]), float(x[1])) for x in sims]
+            except Exception:
+                print("Unexpected format from similar_items for item_idx", item_idx, "type:", type(sims))
+                # as last resort, try to iterate and coerce
+                try:
+                    for el in sims:
+                        if isinstance(el, (list, tuple)) and len(el) >= 2:
+                            pairs.append((int(el[0]), float(el[1])))
+                except Exception:
+                    print("Could not normalize similar_items output for", item_idx)
+                    continue
+
+        # Build neighbor records (skip self and low scores)
+        for sim_idx, score in pairs:
+            if sim_idx == item_idx:
+                continue
+            if score <= MIN_SCORE:
+                continue
+            try:
+                neighbor_item = int(item_uniques[sim_idx])
+            except Exception as e:
+                # If sim_idx is already an item id (rare), try using it directly
+                try:
+                    neighbor_item = int(sim_idx)
+                except Exception:
+                    print("Failed to map sim_idx -> neighbor_item:", sim_idx, "error:", e)
+                    continue
             neighbors_to_upsert.append({
                 "item_id": item_id,
                 "neighbor_id": neighbor_item,
@@ -121,11 +172,16 @@ def compute_and_upsert_neighbors(model, item_uniques):
                 "source": "als",
                 "metadata": {}
             })
+
+        # flush periodically
         if len(neighbors_to_upsert) >= 500:
             upsert_neighbors(neighbors_to_upsert)
             neighbors_to_upsert = []
+
+    # final flush
     if neighbors_to_upsert:
         upsert_neighbors(neighbors_to_upsert)
+
 
 def main():
     print("Fetching training data...")
