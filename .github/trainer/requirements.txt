@@ -1,0 +1,6 @@
+supabase
+pandas
+numpy
+# add your ML libs (implicit ALS packages)
+implicit
+scipy
