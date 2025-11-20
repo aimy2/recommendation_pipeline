@@ -112,7 +112,9 @@ def compute_and_upsert_neighbors(model, item_uniques):
     import numpy as _np
 
     neighbors_to_upsert = []
-    n_items = len(item_uniques)
+        # number of items ALS actually trained
+    n_items = model.item_factors.shape[0]
+
     for item_idx in range(n_items):
         item_id = int(item_uniques[item_idx])
         try:
