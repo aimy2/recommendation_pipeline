@@ -1,5 +1,0 @@
-supabase
-pandas
-numpy
-scipy
-implicit
