@@ -1,9 +1,0 @@
-{
-  "name": "promoter",
-  "version": "1.0.0",
-  "main": "promote-hot.js",
-  "license": "MIT",
-  "dependencies": {
-    "@supabase/supabase-js": "^2.0.0"
-  }
-}
