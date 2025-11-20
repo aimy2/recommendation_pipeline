@@ -90,16 +90,24 @@ def train_als(item_user_csr):
 
 def upsert_neighbors(neighbors):
     CHUNK = 500
+    print("DEBUG: upsert_neighbors called, total neighbors:", len(neighbors))
     for i in range(0, len(neighbors), CHUNK):
         chunk = neighbors[i:i+CHUNK]
-        res = supabase.table('itemneighbors').upsert(chunk).execute()
+        print(f"DEBUG: attempting upsert chunk {i//CHUNK + 1}, size {len(chunk)}")
+        # try/except to catch client-side errors
+        try:
+            res = supabase.table('itemneighbors').upsert(chunk).execute()
+        except Exception as e:
+            print("DEBUG: client-side exception during upsert:", e)
+            continue
         data, error = unwrap_response(res)
+        print("DEBUG: supabase upsert response data (first 5):", (data[:5] if isinstance(data, list) else data))
+        print("DEBUG: supabase upsert response error:", error)
         if error:
-            # Supabase may return error as dict/string — print for debugging and continue or raise
-            print("Upsert error:", error)
-            # raise Exception(error)   # uncomment to fail hard on upsert errors
+            print("DEBUG: failed chunk sample:", chunk[:5])
         else:
-            print(f"Upserted {len(chunk)} neighbors")
+            print(f"Upsert OK chunk size {len(chunk)}")
+
 
 def compute_and_upsert_neighbors(model, item_uniques):
     """
