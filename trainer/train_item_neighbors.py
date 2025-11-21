@@ -7,8 +7,8 @@ SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 test_row = {
-    "item_id": 999999999,
-    "neighbor_id": 111111111,
+    "item_id": 99,
+    "neighbor_id": 11,
     "score": 0.5,
     "source": "test-upsert",
     "metadata": {}
