@@ -252,7 +252,8 @@ def train_als(item_user_csr):
 # --- Neighbors computation & upsert ---
 def upsert_neighbors(neighbors, chunk_size=CHUNK):
     """
-    Upsert neighbors list into itemneighbors table, chunked, using safe upsert fallback.
+    Upsert neighbors list into itemneighbors table, chunked, with dedup within a chunk.
+    Keeps the maximum score for duplicate (item_id, neighbor_id) pairs.
     """
     if not neighbors:
         print("upsert_neighbors: nothing to upsert")
@@ -261,8 +262,11 @@ def upsert_neighbors(neighbors, chunk_size=CHUNK):
     total = 0
     for i in range(0, len(neighbors), chunk_size):
         chunk = neighbors[i:i+chunk_size]
-        # ensure numeric coercion where possible
+
+        # Coerce types and build dedupe map: (item_id, neighbor_id) -> record with max score
+        dedupe = {}
         for r in chunk:
+            # try coerce numeric ids where possible (leave as-is otherwise)
             try:
                 if r.get('item_id') is not None:
                     r['item_id'] = int(r['item_id'])
@@ -280,9 +284,22 @@ def upsert_neighbors(neighbors, chunk_size=CHUNK):
             if 'metadata' not in r:
                 r['metadata'] = {}
 
-        inserted = safe_upsert_or_insert('itemneighbors', chunk)
+            key = (r.get('item_id'), r.get('neighbor_id'))
+            # keep the record with the maximum score
+            existing = dedupe.get(key)
+            if existing is None or r['score'] > existing['score']:
+                dedupe[key] = r
+
+        deduped_chunk = list(dedupe.values())
+
+        # If nothing left after dedupe, continue
+        if not deduped_chunk:
+            print("upsert_neighbors: chunk had no deduped rows, skipping")
+            continue
+
+        inserted = safe_upsert_or_insert('itemneighbors', deduped_chunk)
         total += inserted
-        print(f"upsert_neighbors: chunk attempted {len(chunk)}, approx inserted: {inserted}")
+        print(f"upsert_neighbors: chunk attempted {len(chunk)} -> deduped {len(deduped_chunk)}, approx inserted: {inserted}")
 
     print(f"upsert_neighbors: total approx inserted: {total}")
     return total
