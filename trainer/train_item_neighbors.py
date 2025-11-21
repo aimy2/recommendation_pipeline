@@ -306,138 +306,139 @@ def upsert_neighbors(neighbors, chunk_size=CHUNK):
 
 def compute_and_upsert_neighbors(model, item_uniques):
     """
-    Production-ready neighbor computation.
-    - robustly normalizes implicit.similar_items() outputs
-    - maps matrix indices -> item_uniques when in-range
-    - converts neighbor/item ids to ints when possible
-    - respects MIN_SCORE
-    - uses upsert_neighbors (which performs dedupe per-chunk)
+    Robust neighbor computation that handles cases where the ALS model's
+    item_factors/user_factors axis may be transposed relative to item_uniques.
+
+    Strategy:
+    - If model.item_factors.shape[0] == len(item_uniques) => use model.item_factors
+    - elif model.user_factors.shape[0] == len(item_uniques) => use model.user_factors
+    - else: attempt safe fallbacks (use model.item_factors if available, but warn)
+    - Compute cosine similarity between item vectors and upsert top-K neighbors.
     """
     import numpy as _np
+    from math import isfinite
+
+    # attempt to get factor matrices (may vary by implicit version)
+    item_factors = getattr(model, "item_factors", None)
+    user_factors = getattr(model, "user_factors", None)
+
+    n_itemuni = len(item_uniques)
+    chosen = None
+    factors = None
+
+    # choose the factor matrix that corresponds to items
+    if item_factors is not None and item_factors.shape[0] == n_itemuni:
+        chosen = "item_factors"
+        factors = item_factors
+    elif user_factors is not None and user_factors.shape[0] == n_itemuni:
+        chosen = "user_factors"
+        factors = user_factors
+    elif item_factors is not None:
+        # fallback: use item_factors anyway but warn (may produce only a subset)
+        chosen = "item_factors_fallback"
+        factors = item_factors
+        print("compute_and_upsert_neighbors: WARNING - item_factors length does not equal len(item_uniques). Using item_factors anyway.")
+    elif user_factors is not None:
+        chosen = "user_factors_fallback"
+        factors = user_factors
+        print("compute_and_upsert_neighbors: WARNING - using user_factors fallback (no item_factors present).")
+    else:
+        print("compute_and_upsert_neighbors: no item_factors or user_factors found on model; aborting.")
+        return
+
+    print(f"compute_and_upsert_neighbors: chosen factor matrix = {chosen}, factors.shape = {getattr(factors, 'shape', None)}, len(item_uniques) = {n_itemuni}")
+
+    # coerce to numpy array (float32)
+    try:
+        mat = _np.asarray(factors, dtype=_np.float32)
+    except Exception as e:
+        print("compute_and_upsert_neighbors: could not convert factors to numpy array:", e)
+        return
+
+    n_items_mat = mat.shape[0]
+    dim = mat.shape[1] if mat.ndim > 1 else 1
+
+    # If mat has fewer rows than item_uniques, we will only compute neighbors for the available rows.
+    # But if n_items_mat == n_itemuni we cover everything.
+    if n_items_mat < 1:
+        print("compute_and_upsert_neighbors: factor matrix has zero rows; aborting.")
+        return
+
+    # normalize vectors for cosine similarity
+    norms = _np.linalg.norm(mat, axis=1, keepdims=True)
+    # avoid division by zero
+    norms[norms == 0] = 1.0
+    mat_norm = mat / norms
+
+    # compute similarity matrix in chunks if needed (n_items small usually)
+    # For n up to a few thousands, full mat @ mat.T is fine.
+    try:
+        sims_full = mat_norm @ mat_norm.T  # shape (n_items_mat, n_items_mat)
+    except Exception as e:
+        print("compute_and_upsert_neighbors: failed to compute similarity matrix:", e)
+        return
 
     neighbors_to_upsert = []
 
-    # number of items ALS actually trained
-    n_items = getattr(model, "item_factors", None).shape[0]
-    print("compute_and_upsert_neighbors: model n_items:", n_items, "len(item_uniques):", len(item_uniques))
-
-    # Fetch valid product ids once (non-fatal)
-    valid_products = None
-    try:
-        resp = supabase.table('Product').select('id').execute()
-        data, err = unwrap_response(resp)
-        if not err and data:
-            try:
-                valid_products = set(int(r['id']) for r in (data or []))
-                print("compute_and_upsert_neighbors: fetched valid_products count:", len(valid_products))
-            except Exception:
-                valid_products = None
-        else:
-            valid_products = None
-    except Exception as e:
-        print("compute_and_upsert_neighbors: could not fetch Product ids, continuing without existence check:", e)
-        valid_products = None
-
-    for item_idx in range(n_items):
-        raw_item = item_uniques[item_idx]
+    # For mapping: when we chose a matrix that has same length as item_uniques, 
+    # index i in mat => item_uniques[i]. If mat is smaller, we only process indices up to n_items_mat.
+    # Build mapping function from mat_index -> item_id (try int conversion)
+    def mat_index_to_item_id(idx):
+        if idx < 0 or idx >= n_itemuni:
+            return None
+        raw = item_uniques[idx]
         try:
-            item_id = int(raw_item)
+            return int(raw)
         except Exception:
-            # if item ids are not ints, skip (your DB FK expects ints)
-            print(f"compute_and_upsert_neighbors: skipping item at index {item_idx} because item_id not int: {raw_item}")
+            return raw
+
+    # For each item index in matrix, find top K neighbors (excluding self)
+    for i in range(n_items_mat):
+        item_id = mat_index_to_item_id(i)
+        if item_id is None:
+            # skip if cannot map
             continue
 
+        row = sims_full[i]
+        # row is numpy array length n_items_mat
+        # exclude self by setting -inf
+        row_i = row.copy()
+        row_i[i] = -_np.inf
+
+        # get top K indices using argpartition for speed
+        k = min(TOP_K, len(row_i) - 1)
+        if k <= 0:
+            continue
+
+        # get candidate indices (unsorted)
         try:
-            sims = model.similar_items(item_idx, N=TOP_K + 1)
-        except Exception as e:
-            print("similar_items error for item_idx", item_idx, ":", e)
-            continue
+            idx_part = _np.argpartition(-row_i, k)[:k]
+            # sort these by descending score
+            idx_sorted = idx_part[_np.argsort(-row_i[idx_part])]
+        except Exception:
+            # fallback to argsort full
+            idx_sorted = _np.argsort(-row_i)[:k]
 
-        # Normalize sims into iterable of (sim_idx, score)
-        pairs = []
-        if isinstance(sims, tuple) and len(sims) == 2:
-            try:
-                indices, scores = sims
-                pairs = list(zip(map(int, indices), map(float, scores)))
-            except Exception:
-                try:
-                    indices, scores = sims
-                    pairs = [(int(i), float(s)) for i, s in zip(indices, scores)]
-                except Exception:
-                    pairs = []
-        elif isinstance(sims, _np.ndarray):
-            try:
-                if sims.ndim == 2 and sims.shape[1] >= 2:
-                    pairs = [(int(row[0]), float(row[1])) for row in sims]
-                else:
-                    pairs = [(int(x[0]), float(x[1])) for x in sims.tolist()]
-            except Exception:
-                try:
-                    pairs = [(int(x[0]), float(x[1])) for x in sims.tolist()]
-                except Exception:
-                    pairs = []
-        else:
-            try:
-                for x in sims:
-                    if isinstance(x, (list, tuple)) and len(x) >= 2:
-                        pairs.append((int(x[0]), float(x[1])))
-            except Exception:
-                try:
-                    for el in sims:
-                        if isinstance(el, (list, tuple)) and len(el) >= 2:
-                            pairs.append((int(el[0]), float(el[1])))
-                except Exception:
-                    pairs = []
-
-        if not pairs:
-            continue
-
-        # Normalize sim_idx -> neighbor_id (int) using item_uniques when sim_idx is an index
-        normalized = []
-        for sim_idx, score in pairs:
-            # If sim_idx is a matrix index -> map through item_uniques
-            if isinstance(sim_idx, int) and 0 <= sim_idx < n_items:
-                try:
-                    candidate = item_uniques[sim_idx]
-                    try:
-                        neighbor_id = int(candidate)
-                    except Exception:
-                        # candidate not int -> skip (won't satisfy FK)
-                        # optional debug: print(...)
-                        continue
-                except Exception:
-                    try:
-                        neighbor_id = int(sim_idx)
-                    except Exception:
-                        continue
-            else:
-                # out-of-range -> assume sim_idx is an item id already
-                try:
-                    neighbor_id = int(sim_idx)
-                except Exception:
-                    continue
-
-            normalized.append((neighbor_id, float(score)))
-
-        # Build neighbor records (skip self, low scores, and optionally filter to valid products)
-        for neighbor_id, score in normalized:
-            if neighbor_id == item_id:
+        for j in idx_sorted:
+            score = float(row[j])
+            if not isfinite(score):
                 continue
             if score <= MIN_SCORE:
                 continue
-            if valid_products is not None:
-                if (item_id not in valid_products) or (neighbor_id not in valid_products):
-                    continue
+
+            neighbor_item = mat_index_to_item_id(j)
+            if neighbor_item is None:
+                continue
 
             neighbors_to_upsert.append({
                 "item_id": item_id,
-                "neighbor_id": neighbor_id,
+                "neighbor_id": neighbor_item,
                 "score": float(score),
                 "source": "als",
                 "metadata": {}
             })
 
-        # flush periodically using upsert_neighbors (which dedupes)
+        # flush periodically to avoid huge memory usage
         if len(neighbors_to_upsert) >= CHUNK:
             upsert_neighbors(neighbors_to_upsert, chunk_size=CHUNK)
             neighbors_to_upsert = []
@@ -446,7 +447,7 @@ def compute_and_upsert_neighbors(model, item_uniques):
     if neighbors_to_upsert:
         upsert_neighbors(neighbors_to_upsert, chunk_size=CHUNK)
 
-    print("compute_and_upsert_neighbors: finished.")
+    print("compute_and_upsert_neighbors: finished. attempted upsert count (last chunk may be partial).")
 
 
 
