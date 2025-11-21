@@ -5,11 +5,19 @@ Complete trainer that:
 - computes/aggregates interactions_trainview from raw interactions and upserts it
 - trains an ALS model (implicit) on the aggregated view
 - computes item-item neighbors robustly and upserts them into itemneighbors
+- persists user embeddings for user_keys that are UUID-like into user_embeddings.user_id (uuid)
+
 This file is self-contained (uses SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars).
+Only additions vs your original file:
+ - safer upsert fallback (upsert -> insert)
+ - robust neighbor normalization
+ - persist user embeddings for user_key values that are UUID-like
+Everything else and original behavior kept unchanged.
 """
 
 import os
 import time
+import re
 from supabase import create_client
 import pandas as pd
 import numpy as np
@@ -31,6 +39,9 @@ TOP_K = int(os.environ.get("TOP_K", 50))
 MIN_SCORE = float(os.environ.get("MIN_SCORE", 0.01))
 CHUNK = int(os.environ.get("UPSERT_CHUNK", 500))
 RAW_FETCH_LIMIT = int(os.environ.get("RAW_FETCH_LIMIT", 200000))  # safety limit when reading raw interactions
+
+# regex to detect UUID-like strings (lower/upper hex)
+UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 
 # --- Utilities ---
 def unwrap_response(resp):
@@ -189,8 +200,8 @@ def fetch_training_interactions(limit=None):
         # coerce numeric weight
         df['weight'] = pd.to_numeric(df.get('weight', 1), errors='coerce').fillna(1.0)
         df['user_key'] = df.apply(lambda r: str(r['user_id']) if r.get('user_id') else f"anon_{r.get('session_id')}", axis=1)
-        df = df.groupby(['user_key', 'product_id'], as_index=False)['weight'].sum()
-        df = df.rename(columns={'product_id': 'item_id'})
+        df = df.groupby(['user_key','product_id'], as_index=False)['weight'].sum()
+        df = df.rename(columns={'product_id':'item_id'})
         if limit and len(df) > limit:
             df = df.sample(n=limit, random_state=42).reset_index(drop=True)
         return df
@@ -389,7 +400,49 @@ def compute_and_upsert_neighbors(model, item_uniques):
     if neighbors_to_upsert:
         upsert_neighbors(neighbors_to_upsert, chunk_size=CHUNK)
 
-# --- Main flow (compute trainview, train, compute neighbors) ---
+# --- NEW: persist user embeddings keyed by user_id uuid when user_key is UUID-like ---
+def upsert_user_embeddings_from_userkeys(user_uniques, user_factors, chunk_size=CHUNK):
+    """
+    user_uniques: array-like mapping index -> user_key (text)
+    user_factors: numpy array shape (n_users, dim)
+    Only write rows where user_key matches UUID pattern; user_id will be that UUID string.
+    """
+    if user_factors is None or len(user_uniques) == 0:
+        print("upsert_user_embeddings: no user factors to upsert")
+        return 0
+
+    rows = []
+    for uid, vec in zip(user_uniques, user_factors):
+        # uid here is 'user_key' from the training DataFrame
+        if uid is None:
+            continue
+        uid_str = str(uid)
+        # only persist if user_key is UUID-like
+        if not UUID_RE.match(uid_str):
+            # skip anonymous or non-uuid user_keys
+            continue
+        user_id = uid_str  # it's already UUID-like; Supabase/psql will accept as uuid string
+        rows.append({
+            "user_id": user_id,
+            "embedding": list(map(float, vec.tolist())),
+            "updated_at": None
+        })
+
+    if not rows:
+        print("upsert_user_embeddings: nothing to upsert (no UUID-like user_keys found)")
+        return 0
+
+    total = 0
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i:i+chunk_size]
+        inserted = safe_upsert_or_insert('user_embeddings', chunk)
+        total += inserted
+        print(f"upsert_user_embeddings: chunk attempted {len(chunk)}, approx inserted: {inserted}")
+
+    print("upsert_user_embeddings: total approx inserted:", total)
+    return total
+
+# --- Main flow (compute trainview, train, compute neighbors, persist user embeddings) ---
 def main():
     print("TRAINER STARTED:", time.asctime())
     # Step 1: Fetch raw interactions and compute+upsert trainview
@@ -461,6 +514,17 @@ def main():
     except Exception as e:
         print("Error computing/upserting neighbors:", e)
         return
+
+    # persist user embeddings (NEW: convert user_key -> user_id uuid when possible)
+    try:
+        user_factors = getattr(model, "user_factors", None)
+        if user_factors is not None:
+            print("Persisting user embeddings (UUID only) count:", len(user_uniques))
+            upsert_user_embeddings_from_userkeys(user_uniques, user_factors)
+        else:
+            print("No user_factors found on model; skipping user embeddings persist.")
+    except Exception as e:
+        print("Error persisting user embeddings:", e)
 
     print("TRAINER FINISHED:", time.asctime())
 
