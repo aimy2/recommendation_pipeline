@@ -289,148 +289,128 @@ def upsert_neighbors(neighbors, chunk_size=CHUNK):
 
 def compute_and_upsert_neighbors(model, item_uniques):
     """
-    Robust neighbor computation:
-    - normalize various shapes returned by implicit.similar_items()
-    - treat sim_idx as matrix index when 0 <= sim_idx < n_items, otherwise treat it as an item id
-    - only upsert neighbors where both item_id and neighbor_id are integers and (optionally) exist in Product
+    DEBUG VERSION — temporary.
+    Prints diagnostics for first 10 items and attempts a small test upsert of normalized neighbors.
     """
     import numpy as _np
-
     neighbors_to_upsert = []
 
-    # number of items ALS actually trained
     n_items = getattr(model, "item_factors", None).shape[0]
-    print("compute_and_upsert_neighbors: model n_items:", n_items, "len(item_uniques):", len(item_uniques))
+    print("DBG: model.item_factors.shape:", getattr(model, "item_factors", None).shape)
+    print("DBG: n_items:", n_items, "len(item_uniques):", len(item_uniques))
+    print("DBG: sample item_uniques first 20:", item_uniques[:20])
 
-    # Try to fetch valid product ids once (if Product table exists). If fetch fails, set to None to skip check.
+    # Try to fetch Product ids (non-fatal)
     valid_products = None
     try:
-        resp = supabase.table('Product').select('id').execute()
+        resp = supabase.table('Product').select('id').limit(100000).execute()
         data, err = unwrap_response(resp)
         if not err and data:
-            try:
-                valid_products = set(int(r['id']) for r in (data or []))
-                print("compute_and_upsert_neighbors: fetched valid_products count:", len(valid_products))
-            except Exception:
-                valid_products = None
+            valid_products = set()
+            for r in data:
+                try:
+                    valid_products.add(int(r['id']))
+                except Exception:
+                    pass
+            print("DBG: valid_products count:", len(valid_products))
         else:
-            valid_products = None
+            print("DBG: Product read returned empty or error:", err)
     except Exception as e:
-        print("compute_and_upsert_neighbors: could not fetch Product ids, continuing without existence check:", e)
-        valid_products = None
+        print("DBG: exception fetching Product ids:", e)
 
-    for item_idx in range(n_items):
+    first_normalized_rows = []
+    max_items_check = min(n_items, 10)
+    for item_idx in range(max_items_check):
         raw_item = item_uniques[item_idx]
         try:
-            # prefer integer item_id for FK checks
             item_id = int(raw_item)
         except Exception:
-            # if item ids are not ints, skip (your DB FK expects ints)
-            print(f"compute_and_upsert_neighbors: skipping item at index {item_idx} because item_id not int: {raw_item}")
-            continue
+            item_id = raw_item
+        print(f"DBG: item_idx={item_idx} item_id={item_id}")
 
         try:
             sims = model.similar_items(item_idx, N=TOP_K + 1)
         except Exception as e:
-            print("similar_items error for item_idx", item_idx, ":", e)
+            print("DBG: similar_items error for item_idx", item_idx, ":", e)
             continue
 
-        # Normalize sims into iterable of (sim_idx, score)
+        print("DBG: sims type:", type(sims), "sample:", (sims[:5] if hasattr(sims, '__len__') else repr(sims)))
+
+        # normalize sims -> pairs
         pairs = []
-        # Case A: explicit tuple (indices_array, scores_array)
-        if isinstance(sims, tuple) and len(sims) == 2:
-            try:
+        try:
+            if isinstance(sims, tuple) and len(sims) == 2:
                 indices, scores = sims
                 pairs = list(zip(map(int, indices), map(float, scores)))
-            except Exception:
-                try:
-                    indices, scores = sims
-                    pairs = [(int(i), float(s)) for i, s in zip(indices, scores)]
-                except Exception:
-                    pairs = []
-        # Case B: numpy 2D array [[idx, score], ...]
-        elif isinstance(sims, _np.ndarray):
-            try:
+            elif isinstance(sims, _np.ndarray):
                 if sims.ndim == 2 and sims.shape[1] >= 2:
                     pairs = [(int(row[0]), float(row[1])) for row in sims]
                 else:
                     pairs = [(int(x[0]), float(x[1])) for x in sims.tolist()]
-            except Exception:
-                try:
-                    pairs = [(int(x[0]), float(x[1])) for x in sims.tolist()]
-                except Exception:
-                    pairs = []
-        # Case C: list-like of pairs (the expected default)
-        else:
-            try:
+            else:
                 for x in sims:
                     if isinstance(x, (list, tuple)) and len(x) >= 2:
                         pairs.append((int(x[0]), float(x[1])))
-            except Exception:
-                try:
-                    for el in sims:
-                        if isinstance(el, (list, tuple)) and len(el) >= 2:
-                            pairs.append((int(el[0]), float(el[1])))
-                except Exception:
-                    pairs = []
+        except Exception as e:
+            print("DBG: pairs normalization error for item_idx", item_idx, ":", e)
+            pairs = []
 
-        if not pairs:
-            continue
+        print(f"DBG: pairs len {len(pairs)} sample:", pairs[:5])
 
-        # Normalize each pair into (neighbor_id, score) where neighbor_id is an integer product id
         normalized = []
         for sim_idx, score in pairs:
-            # If sim_idx looks like a matrix index -> map through item_uniques
+            # treat in-range as index -> map to item_uniques
             if isinstance(sim_idx, int) and 0 <= sim_idx < n_items:
                 try:
                     candidate = item_uniques[sim_idx]
                     try:
                         neighbor_id = int(candidate)
                     except Exception:
-                        print(f"compute_and_upsert_neighbors: skipping candidate neighbor (not int) for item_idx {item_idx}: candidate={candidate}")
-                        continue
+                        neighbor_id = candidate
                 except Exception:
-                    try:
-                        neighbor_id = int(sim_idx)
-                    except Exception:
-                        continue
+                    neighbor_id = sim_idx
             else:
-                # out-of-range -> assume sim_idx is actually an item id already
                 try:
                     neighbor_id = int(sim_idx)
                 except Exception:
-                    continue
-
+                    neighbor_id = sim_idx
             normalized.append((neighbor_id, float(score)))
 
-        # Build neighbor records (skip self and low scores, and check existence when available)
-        for neighbor_id, score in normalized:
-            if neighbor_id == item_id:
-                continue
-            if score <= MIN_SCORE:
-                continue
+        print("DBG: normalized sample:", normalized[:10])
 
-            # If we fetched valid_products, ensure both exist
-            if valid_products is not None:
-                if (item_id not in valid_products) or (neighbor_id not in valid_products):
-                    continue
-
-            neighbors_to_upsert.append({
-                "item_id": item_id,
-                "neighbor_id": neighbor_id,
-                "score": float(score),
-                "source": "als",
+        for nb, sc in normalized[:10]:
+            # append sample rows intended for one-shot upsert
+            try:
+                row_item = int(item_id) if isinstance(item_id, (int, np.integer)) or str(item_id).isdigit() else item_id
+            except Exception:
+                row_item = item_id
+            try:
+                row_nb = int(nb) if isinstance(nb, (int, np.integer)) or str(nb).isdigit() else nb
+            except Exception:
+                row_nb = nb
+            first_normalized_rows.append({
+                "item_id": row_item,
+                "neighbor_id": row_nb,
+                "score": float(sc),
+                "source": "als-debug",
                 "metadata": {}
             })
 
-        # flush periodically
-        if len(neighbors_to_upsert) >= CHUNK:
-            upsert_neighbors(neighbors_to_upsert, chunk_size=CHUNK)
-            neighbors_to_upsert = []
+    print("DBG: collected normalized rows count:", len(first_normalized_rows))
+    if first_normalized_rows:
+        try:
+            print("DBG: attempting small test upsert", len(first_normalized_rows))
+            resp = supabase.table('itemneighbors').upsert(first_normalized_rows).execute()
+            data, err = unwrap_response(resp)
+            print("DBG: upsert data:", data)
+            print("DBG: upsert error:", err)
+        except Exception as e:
+            print("DBG: exception during test upsert:", e)
+    else:
+        print("DBG: nothing to upsert")
 
-    # final flush
-    if neighbors_to_upsert:
-        upsert_neighbors(neighbors_to_upsert, chunk_size=CHUNK)
+    print("DBG: debug compute_and_upsert_neighbors finished")
+
 
 # --- NEW: persist user embeddings keyed by user_id uuid when user_key is UUID-like ---
 def upsert_user_embeddings_from_userkeys(user_uniques, user_factors, chunk_size=CHUNK):
