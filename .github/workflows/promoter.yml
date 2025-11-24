@@ -1,25 +1,53 @@
 name: Promoter - hot neighbors
+
 on:
   schedule:
-    - cron: '*/15 * * * *'   # every 15 minutes
+    - cron: '0 */12 * * *'   # every 12 hours: at 00:00 and 12:00 UTC
   workflow_dispatch:
 
 jobs:
   promote:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install deps
+
+      - name: Cache promoter node_modules
+        uses: actions/cache@v4
+        with:
+          path: promoter/node_modules
+          key: promoter-node-modules-${{ runner.os }}-${{ hashFiles('promoter/package-lock.json') }}
+          restore-keys: |
+            promoter-node-modules-${{ runner.os }}-
+
+      - name: Install dependencies (promoter)
+        working-directory: promoter
         run: |
-          cd promoter
-          npm ci
+          if [ -f package-lock.json ]; then
+            echo "Found package-lock.json — using npm ci"
+            npm ci --no-audit --no-fund
+          else
+            echo "No package-lock.json — using npm install"
+            npm install --no-audit --no-fund
+          fi
+
       - name: Run promoter
+        working-directory: promoter
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          node promoter/promote-hot.js
+          node promote-hot.js
+
+      - name: Success
+        if: ${{ success() }}
+        run: echo "Promoter job completed successfully"
