@@ -1,7 +1,7 @@
 name: Trainer - ALS nightly
 on:
   schedule:
-    - cron: '0 3 * * *' # UTC 03:00 daily (adjust)
+    - cron: '0 3 * * *' # UTC 03:00 daily 
   workflow_dispatch:
 
 jobs:
